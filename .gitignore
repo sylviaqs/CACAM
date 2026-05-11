@@ -9,3 +9,5 @@ result/
 venv/
 results/
 run.log
+
+.download
