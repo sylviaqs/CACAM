@@ -17,15 +17,13 @@ SUMMARY_FILE="result/${BASE_SAVE_PATH}/${JOB_NAME}/hpo_results.csv"
 mkdir -p "$LOG_DIR" "$(dirname "$SUMMARY_FILE")"
 
 OBJECTIVE_METRIC="${OBJECTIVE_METRIC:-affiliation_f}"
-DATASETS=("SMAP.csv" "PSM.csv" "Genesis.csv")
+DATASETS=("PSM.csv" "Genesis.csv")
 
 declare -A ANOMALY_RATIO_MAP=(
-    ["SMAP.csv"]=2.0
     ["PSM.csv"]=3.0
     ["Genesis.csv"]=0.5
 )
 declare -A BATCH_SIZE_MAP=(
-    ["SMAP.csv"]=128
     ["PSM.csv"]=128
     ["Genesis.csv"]=32
 )
@@ -75,6 +73,7 @@ run_bench() {
         --data-name-list "$dataset" \
         --model-name "$CONFIG_MODEL_NAME" \
         --model-hyper-params "{
+            \"experiment_model_name\": \"CACAM\",
             \"lr\": ${LR},
             \"model_variant\": \"${MODEL_VARIANT}\",
             \"batch_size\": ${batch_size},

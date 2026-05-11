@@ -15,6 +15,9 @@ from ts_benchmark.baselines.CACAM.models import (
     GrangerFeatureTemporalTransformerModel,
     CACAMModel,
 )
+from ts_benchmark.baselines.CACAM.models.granger_feature_temporal_transformer_model import (
+    estimate_window_granger_graph,
+)
 from ts_benchmark.baselines.utils import anomaly_detection_data_provider
 from ts_benchmark.baselines.utils import train_val_split
 from ts_benchmark.baselines.catch.utils.observability import (
@@ -70,6 +73,12 @@ DEFAULT_CACAM_HYPER_PARAMS = {
     "granger_mask_type": "soft",
     "granger_bias": 2.0,
     "granger_graph_path": None,
+    "dynamic_granger": True,
+    "granger_lag": 3,
+    "granger_alpha": 0.05,
+    "granger_standardize": True,
+    "precompute_granger": False,
+    "granger_debug_print": False,
     "experiment_model_name": None,
     "anomaly_ratio": [0.1, 0.5, 1.0, 2, 3, 5.0, 10.0, 15, 20, 25],
 }
@@ -233,6 +242,38 @@ class CACAM:
     def detect_hyper_param_tune(self, train_data: pd.DataFrame):
         self.config.c_in = train_data.shape[1]
 
+    def _maybe_precompute_granger_graph(self, train_data: pd.DataFrame, paths):
+        config = self.config
+        if str(get_cfg_value(config, "model_variant", "CACAM")) != "granger_feature_temporal_transformer":
+            return
+        if not as_bool(get_cfg_value(config, "precompute_granger", False)):
+            return
+        if get_cfg_value(config, "granger_graph_path", None) not in (None, ""):
+            set_cfg_value(config, "dynamic_granger", False)
+            return
+        if int(get_cfg_value(config, "feature_layers", 1)) <= 0:
+            return
+
+        lag = int(get_cfg_value(config, "granger_lag", 3))
+        alpha = float(get_cfg_value(config, "granger_alpha", 0.05))
+        standardize = as_bool(get_cfg_value(config, "granger_standardize", True))
+        graph_dir = paths.exp_dir / "precomputed"
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        graph_path = graph_dir / f"granger_lag{lag}_alpha{alpha:g}.npy"
+
+        values = torch.as_tensor(train_data.values, dtype=torch.float32).unsqueeze(0)
+        graph = estimate_window_granger_graph(
+            values,
+            max_lag=lag,
+            alpha=alpha,
+            standardize=standardize,
+        )[0].cpu().numpy()
+        np.save(graph_path, graph)
+        set_cfg_value(config, "granger_graph_path", str(graph_path))
+        set_cfg_value(config, "dynamic_granger", False)
+        set_cfg_value(config, "precomputed_granger_graph_path", str(graph_path))
+        write_json(paths.config_path, to_serializable(config))
+
     def detect_validate(self, valid_data_loader, max_batches=None):
         total_loss = []
         total_samples = 0
@@ -275,6 +316,7 @@ class CACAM:
             columns=valid_data.columns,
             index=valid_data.index,
         )
+        self._maybe_precompute_granger_graph(train_data_value, paths)
 
         self.train_data_loader = anomaly_detection_data_provider(
             train_data_value,
