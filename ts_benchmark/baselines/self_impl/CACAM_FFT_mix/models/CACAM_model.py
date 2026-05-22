@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 class CausalConstraintAttention(nn.Module):
     def __init__(self, d_model, n_heads=1, dropout=0.1):
@@ -44,7 +43,6 @@ class CausalConstraintAttention(nn.Module):
         out = torch.matmul(attn, V).transpose(1, 2).reshape(B, C, self.d_model)
         return self.out_proj(out), attn
 
-
 class Basic_CACAM(nn.Module):
     def __init__(self, configs):
         super(Basic_CACAM, self).__init__()
@@ -56,32 +54,23 @@ class Basic_CACAM(nn.Module):
         self.causal_max_lag = getattr(configs, "causal_max_lag", 3)
         self.causal_pc_alpha = getattr(configs, "causal_pc_alpha", 0.05)
         
-        # 时域特征投影
+        # Time-domain feature projection: [B, C, T] -> [B, C, d_model]
         self.feature_proj = nn.Sequential(
             nn.Linear(self.seq_len, self.d_model),
             nn.GELU(),
             nn.Dropout(self.dropout)
         )
-        
-        # 频域特征投影 - 使用卷积提取频域模式
-        # 输入: [B, C, freq_len] 其中 freq_len = seq_len//2 + 1 (rfft结果)
-        freq_len = self.seq_len // 2 + 1
+
+        # Frequency-domain feature projection.
+        # rFFT over the temporal axis returns seq_len//2 + 1 frequency bins.
+        self.freq_len = self.seq_len // 2 + 1
         self.freq_proj = nn.Sequential(
-            nn.Conv1d(
-                in_channels=1,  # 每个通道单独处理
-                out_channels=16,
-                kernel_size=3,
-                padding=1
-            ),
-            nn.GELU(),
-            nn.AdaptiveAvgPool1d(1),  # 固定输出长度为1，避免MPS不可整除问题
-            nn.Flatten(start_dim=1),
-            nn.Linear(16, self.d_model),
+            nn.Linear(self.freq_len, self.d_model),
             nn.GELU(),
             nn.Dropout(self.dropout)
         )
-        
-        # 融合时频特征的投影层
+
+        # Fuse time-domain and frequency-domain hidden states.
         self.fusion_proj = nn.Sequential(
             nn.Linear(self.d_model * 2, self.d_model),
             nn.GELU(),
@@ -278,38 +267,32 @@ class Basic_CACAM(nn.Module):
     def forward(self, x):
         # x: [B, T, C]
         B, T, C = x.shape
-        
+
         # 1. Compute causal or dependency weight matrix.
         causal_weight = self.compute_causal_weight(x)
-        
-        # 2. 时域特征提取
-        x_t = x.transpose(1, 2)  # [B, C, T]
+
+        # 2. Build time-domain hidden states.
+        # Transpose to [B, C, T] so each channel is represented by its temporal window.
+        x_t = x.transpose(1, 2)
         h_time = self.feature_proj(x_t)  # [B, C, d_model]
-        
-        # 3. 频域特征提取 - 对每个通道单独做rfft，取幅值
-        # rfft on time dimension: [B, C, T] -> [B, C, freq_len]
-        freq_len = self.seq_len // 2 + 1
-        fft_result = torch.fft.rfft(x_t, dim=-1)
-        freq_magnitude = torch.abs(fft_result)  # [B, C, freq_len]
-        
-        # 频域特征通过卷积提取模式
-        # Reshape to [B*C, 1, freq_len]
-        freq_magnitude_flat = freq_magnitude.reshape(B * C, 1, freq_len)
-        h_freq_conv = self.freq_proj(freq_magnitude_flat)  # [B*C, d_model]
-        h_freq = h_freq_conv.reshape(B, C, self.d_model)  # [B, C, d_model]
-        
-        # 4. 时频特征融合
-        h_fused = torch.cat([h_time, h_freq], dim=-1)  # [B, C, d_model*2]
-        h_fused = self.fusion_proj(h_fused)  # [B, C, d_model]
-        
-        # 5. Apply Causal Constraint Attention on fused features
-        h_attn, attn_weights = self.causal_attn(h_fused, causal_weight)
-        
-        # 6. Residual connection & Reconstruct
-        h_out = F.gelu(h_fused + h_attn)
+
+        # 3. Build frequency-domain hidden states via rFFT over the temporal axis.
+        # We use the magnitude spectrum to avoid complex-valued downstream layers.
+        x_freq = torch.fft.rfft(x_t, dim=-1)
+        x_freq_mag = torch.abs(x_freq)  # [B, C, freq_len]
+        h_freq = self.freq_proj(x_freq_mag)  # [B, C, d_model]
+
+        # 4. Fuse time- and frequency-domain representations.
+        h = self.fusion_proj(torch.cat([h_time, h_freq], dim=-1))  # [B, C, d_model]
+
+        # 5. Apply causal/dependency-constrained attention on fused features.
+        h_attn, attn_weights = self.causal_attn(h, causal_weight)
+
+        # 6. Residual connection & reconstruction back to the temporal window.
+        h_out = F.gelu(h + h_attn)
         x_recon = self.reconstruct_proj(h_out)  # [B, C, T]
-        
+
         # Transpose back to [B, T, C]
         x_recon = x_recon.transpose(1, 2)
-        
+
         return x_recon, causal_weight

@@ -27,6 +27,10 @@ DEFAULT_CACAM_BASED_HYPER_PARAMS = {
     "lradj": "type1",
     "patience": 3,
     "pct_start": 0.3,
+    "use_freq_loss": True,
+    "freq_loss_weight": 0.2,
+    "freq_score_weight": 0.2,
+    "freq_use_log_magnitude": True,
     "anomaly_ratio": [0.1, 0.5, 1.0, 2, 3, 5.0, 10.0, 15, 20, 25],
 }
 
@@ -118,7 +122,7 @@ class CACAM:
         super(CACAM, self).__init__()
         self.config = CACAMConfig(**kwargs)
         self.scaler = StandardScaler()
-        self.model_name = "CACAM"
+        self.model_name = "CACAM_FFT_mix"
         self.device = get_available_device()
         self.model = Basic_CACAM(self.config).to(self.device)
         self.criterion = nn.MSELoss()
@@ -127,6 +131,47 @@ class CACAM:
     def required_hyper_params() -> dict:
         return {}
 
+    def _compute_frequency_loss(self, reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Frequency-domain reconstruction loss on magnitude spectrum."""
+        recon_freq = torch.fft.rfft(reconstructed.transpose(1, 2), dim=-1)
+        target_freq = torch.fft.rfft(target.transpose(1, 2), dim=-1)
+        recon_mag = torch.abs(recon_freq)
+        target_mag = torch.abs(target_freq)
+
+        if getattr(self.config, "freq_use_log_magnitude", True):
+            recon_mag = torch.log1p(recon_mag)
+            target_mag = torch.log1p(target_mag)
+
+        return self.criterion(recon_mag, target_mag)
+
+    def _compute_total_loss(self, reconstructed: torch.Tensor, target: torch.Tensor):
+        time_loss = self.criterion(reconstructed, target)
+        if not getattr(self.config, "use_freq_loss", True):
+            zero = torch.zeros((), device=target.device, dtype=target.dtype)
+            return time_loss, time_loss.detach(), zero
+
+        freq_loss = self._compute_frequency_loss(reconstructed, target)
+        total_loss = time_loss + getattr(self.config, "freq_loss_weight", 0.2) * freq_loss
+        return total_loss, time_loss.detach(), freq_loss.detach()
+
+    def _compute_window_scores(self, reconstructed: torch.Tensor, target: torch.Tensor) -> np.ndarray:
+        """Return per-timestep window scores with optional frequency penalty."""
+        time_error = (reconstructed - target) ** 2  # [B, T, C]
+        point_score = time_error.mean(dim=-1)  # [B, T]
+
+        if getattr(self.config, "use_freq_loss", True):
+            recon_freq = torch.fft.rfft(reconstructed.transpose(1, 2), dim=-1)
+            target_freq = torch.fft.rfft(target.transpose(1, 2), dim=-1)
+            recon_mag = torch.abs(recon_freq)
+            target_mag = torch.abs(target_freq)
+            if getattr(self.config, "freq_use_log_magnitude", True):
+                recon_mag = torch.log1p(recon_mag)
+                target_mag = torch.log1p(target_mag)
+            freq_error = ((recon_mag - target_mag) ** 2).mean(dim=(-1, -2), keepdim=True)  # [B,1,1]
+            point_score = point_score + getattr(self.config, "freq_score_weight", 0.2) * freq_error.squeeze(-1)
+
+        return point_score.detach().cpu().numpy()
+
     def detect_validate(self, valid_data_loader):
         total_loss = []
         self.model.eval()
@@ -134,7 +179,7 @@ class CACAM:
             for i, (input, _) in enumerate(valid_data_loader):
                 input = input.float().to(self.device)
                 reconstructed, _ = self.model(input)
-                loss = self.criterion(reconstructed, input)
+                loss, _, _ = self._compute_total_loss(reconstructed, input)
                 total_loss.append(loss.item())
         self.model.train()
         return np.average(total_loss)
@@ -212,7 +257,7 @@ class CACAM:
                 input = input.float().to(self.device)
                 
                 reconstructed, _ = self.model(input)
-                loss = self.criterion(reconstructed, input)
+                loss, time_loss, freq_loss = self._compute_total_loss(reconstructed, input)
                 
                 train_loss.append(loss.item())
 
@@ -264,16 +309,11 @@ class CACAM:
             for i, (batch_x, batch_y) in enumerate(test_loader):
                 batch_x = batch_x.float().to(self.device)
                 reconstructed, _ = self.model(batch_x)
-                
-                # Anomaly score based on reconstruction error
-                # Calculate MSE per point [B, T, C]
-                error = (reconstructed - batch_x) ** 2
-                score = error.detach().cpu().numpy()
+                score = self._compute_window_scores(reconstructed, batch_x)
                 attens_energy.append(score)
 
-        attens_energy = np.concatenate(attens_energy, axis=0) # [nb x t x c]
-        attens_energy = attens_energy.reshape(-1, attens_energy.shape[-1]) # [nb*t x c]
-        test_energy = np.mean(attens_energy, axis=-1) # [nb*t]
+        attens_energy = np.concatenate(attens_energy, axis=0) # [nb x t]
+        test_energy = attens_energy.reshape(-1) # [nb*t]
         
         # Return energy as score. ts_benchmark typically requires return score, score or similar
         return test_energy, test_energy
@@ -290,12 +330,11 @@ class CACAM:
             for i, (batch_x, batch_y) in enumerate(self.train_data_loader):
                 batch_x = batch_x.float().to(self.device)
                 reconstructed, _ = self.model(batch_x)
-                error = (reconstructed - batch_x) ** 2
-                train_energy.append(error.detach().cpu().numpy())
+                score = self._compute_window_scores(reconstructed, batch_x)
+                train_energy.append(score)
                 
         train_energy = np.concatenate(train_energy, axis=0)
-        train_energy = train_energy.reshape(-1, train_energy.shape[-1])
-        train_energy = np.mean(train_energy, axis=-1)
+        train_energy = train_energy.reshape(-1)
         
         test_energy, _ = self.detect_score(test)
         combined_energy = np.concatenate([train_energy, test_energy], axis=0)

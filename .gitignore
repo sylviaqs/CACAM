@@ -44,6 +44,7 @@ dataset/
 
 # Logs
 *.log
+agent_workspace/
 
 # Model checkpoints
 *.pth

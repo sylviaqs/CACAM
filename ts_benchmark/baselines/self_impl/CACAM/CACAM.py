@@ -17,10 +17,11 @@ DEFAULT_CACAM_BASED_HYPER_PARAMS = {
     "d_model": 128,
     "n_heads": 4,
     "dropout": 0.1,
-    "causal_method": "pcmci",
+    "causal_bias_mode": "log",
+    "causal_method": "corr",
+    "use_causal_weight": True,
     "causal_max_lag": 3,
     "causal_pc_alpha": 0.05,
-    "freq_weight": 0.5,
     "train_epochs": 10,
     "batch_size": 128,
     "optim": "adam",
@@ -28,7 +29,22 @@ DEFAULT_CACAM_BASED_HYPER_PARAMS = {
     "lradj": "type1",
     "patience": 3,
     "pct_start": 0.3,
-    "anomaly_ratio": [0.1, 0.5, 1.0, 2, 3, 5.0, 10.0, 15, 20, 25],
+    "anomaly_ratio": [
+        0.1,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        2.5,
+        3.0,
+        4.0,
+        5.0,
+        7.5,
+        10.0,
+        12.5,
+        15,
+        20,
+    ],
 }
 
 
@@ -107,14 +123,12 @@ class EarlyStopping:
             )
         self.val_loss_min = val_loss
 
-
 class CACAMConfig:
     def __init__(self, **kwargs):
         for key, value in DEFAULT_CACAM_BASED_HYPER_PARAMS.items():
             setattr(self, key, value)
         for key, value in kwargs.items():
             setattr(self, key, value)
-
 
 class CACAM:
     def __init__(self, **kwargs):
@@ -136,11 +150,33 @@ class CACAM:
         with torch.no_grad():
             for i, (input, _) in enumerate(valid_data_loader):
                 input = input.float().to(self.device)
-                reconstructed, _, _, _ = self.model(input)
+                reconstructed, _ = self.model(input)
                 loss = self.criterion(reconstructed, input)
                 total_loss.append(loss.item())
         self.model.train()
         return np.average(total_loss)
+
+    def _maybe_precompute_static_causal_weight(self, train_data_scaled: pd.DataFrame):
+        if not getattr(self.config, "causal_static", False):
+            return
+        method = str(getattr(self.config, "causal_method", "")).lower()
+        if method not in {"granger", "granger_causality", "pcmci"}:
+            return
+        print(
+            f"Precomputing static causal weight once using {method} on full training data..."
+        )
+        x = torch.tensor(
+            train_data_scaled.values, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        self.model.eval()
+        with torch.no_grad():
+            if method in {"granger", "granger_causality"}:
+                weight = self.model.compute_causal_weight_granger(x)
+            else:
+                weight = self.model.compute_causal_weight_pcmci(x)
+        self.model.set_static_causal_weight(weight)
+        self.model.train()
+        print("Static causal weight cached.")
 
     def fit(self, train_data: pd.DataFrame, valid_data: pd.DataFrame = None):
         from ts_benchmark.baselines.utils import train_val_split
@@ -152,6 +188,8 @@ class CACAM:
             columns=train_data_value.columns,
             index=train_data_value.index
         )
+
+        self._maybe_precompute_static_causal_weight(train_data_scaled)
         
         self.train_data_loader = anomaly_detection_data_provider(
             train_data_scaled,
@@ -163,7 +201,7 @@ class CACAM:
         
         if valid_data is not None:
             if isinstance(valid_data, tuple):
-                valid_data = valid_data[0]
+                valid_data = valid_data[0] # handle split_before tuple return if applicable
                 
             if len(valid_data.shape) > 0 and valid_data.shape[0] > 0:
                 valid_data_scaled = pd.DataFrame(
@@ -214,7 +252,7 @@ class CACAM:
                 self.optimizer.zero_grad()
                 input = input.float().to(self.device)
                 
-                reconstructed, _, _, _ = self.model(input)
+                reconstructed, _ = self.model(input)
                 loss = self.criterion(reconstructed, input)
                 
                 train_loss.append(loss.item())
@@ -266,19 +304,25 @@ class CACAM:
         with torch.no_grad():
             for i, (batch_x, batch_y) in enumerate(test_loader):
                 batch_x = batch_x.float().to(self.device)
-                reconstructed, _, time_recon, freq_recon = self.model(batch_x)
+                reconstructed, _ = self.model(batch_x)
                 
+                # Anomaly score based on reconstruction error
+                # Calculate MSE per point [B, T, C]
                 error = (reconstructed - batch_x) ** 2
                 score = error.detach().cpu().numpy()
                 attens_energy.append(score)
 
-        attens_energy = np.concatenate(attens_energy, axis=0)
-        attens_energy = attens_energy.reshape(-1, attens_energy.shape[-1])
-        test_energy = np.mean(attens_energy, axis=-1)
+        attens_energy = np.concatenate(attens_energy, axis=0) # [nb x t x c]
+        attens_energy = attens_energy.reshape(-1, attens_energy.shape[-1]) # [nb*t x c]
+        test_energy = np.mean(attens_energy, axis=-1) # [nb*t]
         
+        # Return energy as score. ts_benchmark typically requires return score, score or similar
         return test_energy, test_energy
 
     def detect_label(self, test: pd.DataFrame) -> np.ndarray:
+        # Implement a naive thresholding based on training data reconstruction error
+        # Normally ts_benchmark handles thresholding itself with detect_score and its metrics.
+        # But we implement this to satisfy interface.
         self.model.load_state_dict(self.early_stopping.check_point)
         self.model.eval()
         
@@ -286,7 +330,7 @@ class CACAM:
         with torch.no_grad():
             for i, (batch_x, batch_y) in enumerate(self.train_data_loader):
                 batch_x = batch_x.float().to(self.device)
-                reconstructed, _, _, _ = self.model(batch_x)
+                reconstructed, _ = self.model(batch_x)
                 error = (reconstructed - batch_x) ** 2
                 train_energy.append(error.detach().cpu().numpy())
                 
